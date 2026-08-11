@@ -61,15 +61,16 @@ main() {
     # Check if nanobanana-mcp is already configured
     MCP_CONFIGURED=false
     if [ -f "${SETTINGS_FILE}" ]; then
-        if python3 -c "
-import json
-with open('${SETTINGS_FILE}', 'r') as f:
+        if python3 - "${SETTINGS_FILE}" <<'PY' 2>/dev/null; then
+import json, sys
+settings_path = sys.argv[1]
+with open(settings_path, 'r') as f:
     settings = json.load(f)
 if 'mcpServers' in settings and 'nanobanana-mcp' in settings['mcpServers']:
-    exit(0)
+    sys.exit(0)
 else:
-    exit(1)
-" 2>/dev/null; then
+    sys.exit(1)
+PY
             MCP_CONFIGURED=true
             echo "✓ nanobanana-mcp already configured in settings.json"
         fi
@@ -91,42 +92,49 @@ else:
 
         # Configure MCP server
         echo "→ Configuring nanobanana-mcp server..."
-        python3 -c "
-import json, os
+        # Credentials are passed as argv (never interpolated into the source string)
+        # and the settings file is written atomically with 0600 permissions.
+        python3 - "${SETTINGS_FILE}" "${GOOGLE_AI_API_KEY}" <<'PY'
+import json, os, sys, tempfile
 
-settings_path = '${SETTINGS_FILE}'
+settings_path, api_key = sys.argv[1:3]
 
-# Read existing settings or create new
 if os.path.exists(settings_path):
-    with open(settings_path, 'r') as f:
-        settings = json.load(f)
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except json.JSONDecodeError:
+        settings = {}
 else:
     settings = {}
 
-# Ensure mcpServers key exists
-if 'mcpServers' not in settings:
-    settings['mcpServers'] = {}
-
-# Add nanobanana-mcp server config
-settings['mcpServers']['nanobanana-mcp'] = {
+settings.setdefault('mcpServers', {})['nanobanana-mcp'] = {
     'command': 'npx',
     'args': ['-y', '@ycse/nanobanana-mcp@1.1.1'],
     'env': {
-        'GOOGLE_AI_API_KEY': '''${GOOGLE_AI_API_KEY}'''
-    }
+        'GOOGLE_AI_API_KEY': api_key,
+    },
 }
 
-# Write back
-os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-with open(settings_path, 'w') as f:
-    json.dump(settings, f, indent=2)
+os.makedirs(os.path.dirname(settings_path) or '.', exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(settings_path) or '.', prefix='.settings.', suffix='.json')
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(settings, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, settings_path)
+except Exception:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
 
 print('  ✓ nanobanana-mcp configured in settings.json')
-" || {
+PY
+        if [ $? -ne 0 ]; then
             echo "✗ Could not auto-configure MCP server."
             echo "  See: extensions/banana/docs/BANANA-SETUP.md"
             exit 1
-        }
+        fi
     fi
 
     # Install skill
@@ -145,6 +153,18 @@ print('  ✓ nanobanana-mcp configured in settings.json')
     mkdir -p "${SKILL_DIR}/scripts" "${SKILL_DIR}/references"
     cp "${SOURCE_DIR}/scripts/"*.py "${SKILL_DIR}/scripts/"
     cp "${SOURCE_DIR}/references/"*.md "${SKILL_DIR}/references/"
+
+    # Rewrite only files copied by this extension install. Manual installs do
+    # not receive plugin bin/ PATH injection.
+    for installed_doc in "${SKILL_DIR}/SKILL.md" "${SKILL_DIR}/references/"*.md "${AGENT_DIR}/seo-image-gen.md"; do
+        [ -f "${installed_doc}" ] || continue
+        temp_doc="${installed_doc}.claude-seo-tmp"
+        sed -e 's#claude-seo run#"$HOME/.claude/skills/seo/bin/claude-seo" run#g' \
+            -e 's#claude-seo setup#"$HOME/.claude/skills/seo/bin/claude-seo" setup#g' \
+            -e 's#claude-seo doctor#"$HOME/.claude/skills/seo/bin/claude-seo" doctor#g' \
+            "${installed_doc}" > "${temp_doc}"
+        mv "${temp_doc}" "${installed_doc}"
+    done
 
     # Pre-warm npm package without starting the MCP server binary.
     echo "→ Pre-downloading nanobanana-mcp..."
